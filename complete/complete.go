@@ -71,6 +71,12 @@ func completeRun(apiToken, projectCode string, runID int) bool {
 		return false
 	}
 
+	if apiResp.Status {
+		fmt.Printf("Successfully marked Run ID %d as complete ✅\n", runID) // <-- Success message
+	} else {
+		fmt.Printf("Failed to mark Run ID %d as complete ❌\n", runID)
+	}
+
 	return apiResp.Status
 }
 

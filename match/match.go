@@ -22,9 +22,10 @@ type APIResponse struct {
 }
 
 type TestResult struct {
-	RunID  int    `json:"run_id"`
-	CaseID int    `json:"case_id"`
-	Status string `json:"status"`
+	RunID   int    `json:"run_id"`
+	CaseID  int    `json:"case_id"`
+	Status  string `json:"status"`
+	EndTime string `json:"end_time"`
 }
 
 func MatchResults() {
@@ -70,6 +71,8 @@ func readRunIDs(filename string) []int {
 		fmt.Println("Error reading file:", err)
 		return nil
 	}
+	fmt.Printf("Contents of %s: %s\n", filename, string(content))
+
 	parts := strings.Split(strings.TrimSpace(string(content)), ",")
 	var runIDs []int
 	for _, part := range parts {
@@ -77,6 +80,7 @@ func readRunIDs(filename string) []int {
 		fmt.Sscanf(part, "%d", &id)
 		runIDs = append(runIDs, id)
 	}
+	fmt.Printf("Parsed Run IDs: %v\n", runIDs)
 	return runIDs
 }
 
@@ -88,21 +92,25 @@ func fetchCasesForRunID(apiToken, projectCode string, runID int) ([]int, bool) {
 
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		fmt.Println("API request failed:", err)
+		fmt.Printf("API request failed for runID %d: %v\n", runID, err)
 		return nil, false
 	}
 	defer res.Body.Close()
 
 	body, _ := io.ReadAll(res.Body)
+	fmt.Printf("API Response for runID %d: %s\n", runID, string(body))
+
 	var apiResp APIResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
-		fmt.Println("Error parsing JSON response:", err)
+		fmt.Printf("Error parsing JSON response for runID %d: %v\n", runID, err)
 		return nil, false
 	}
 
 	if !apiResp.Status || apiResp.Result.Status != 0 {
+		fmt.Printf("Invalid API response for runID %d (Status: %d)\n", runID, apiResp.Result.Status)
 		return nil, false
 	}
+
 	return apiResp.Result.Cases, true
 }
 
@@ -120,40 +128,51 @@ func readResults(filename string) []TestResult {
 		var result TestResult
 		if err := json.Unmarshal([]byte(scanner.Text()), &result); err == nil {
 			results = append(results, result)
+		} else {
+			fmt.Printf("Error parsing test result JSON: %s\n", scanner.Text())
 		}
 	}
+	fmt.Printf("Total test results read: %d\n", len(results))
 	return results
 }
 
 func validateRunCases(runID int, caseIDs []int, results []TestResult) bool {
-	caseCount := make(map[int]int)
-	for _, caseID := range caseIDs {
-		caseCount[caseID]++
-	}
+	fmt.Printf("Validating runID: %d with expected cases: %v\n", runID, caseIDs)
 
 	foundCases := make(map[int]int)
-	passedCases := make(map[int]bool) // Track if all results for a case have passed
+	latestPassTime := make(map[int]string)
+	passedCases := make(map[int]bool)
 
 	for _, result := range results {
 		if result.RunID == runID {
 			foundCases[result.CaseID]++
-			if result.Status != "passed" {
-				passedCases[result.CaseID] = false
-			} else if _, exists := passedCases[result.CaseID]; !exists {
+			if result.Status == "passed" {
 				passedCases[result.CaseID] = true
+				if latestPassTime[result.CaseID] == "" || result.EndTime > latestPassTime[result.CaseID] {
+					latestPassTime[result.CaseID] = result.EndTime
+				}
 			}
 		}
 	}
 
-	for caseID, expectedCount := range caseCount {
-		if foundCases[caseID] < expectedCount || !passedCases[caseID] {
-			return false
+	for _, result := range results {
+		if result.RunID == runID && result.Status != "passed" {
+			if latestPassTime[result.CaseID] != "" && result.EndTime > latestPassTime[result.CaseID] {
+				fmt.Printf("RunID %d failed validation: Case %d has a non-passed result (%s) after latest pass at %s\n",
+					runID, result.CaseID, result.Status, latestPassTime[result.CaseID])
+				return false
+			}
 		}
 	}
+
+	fmt.Printf("RunID %d is valid\n", runID)
 	return true
 }
 
 func writeValidRunIDs(filename string, runIDs []string) {
+	fmt.Printf("Final list of valid runIDs to be written: %v\n", runIDs)
 	content := strings.Join(runIDs, ",")
-	os.WriteFile(filename, []byte(content), 0644)
+	if err := os.WriteFile(filename, []byte(content), 0644); err != nil {
+		fmt.Printf("Error writing to file %s: %v\n", filename, err)
+	}
 }

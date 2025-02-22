@@ -81,8 +81,17 @@ func processResults(runResults map[int][]TestResult) []int {
 		for _, caseResults := range caseStatuses {
 			hasPassed := false
 			latestPassedTime := ""
+			latestOverallTime := ""
+			latestOverallStatus := ""
 
 			for _, result := range caseResults {
+				// Track the latest overall result (regardless of status)
+				if result.EndTime > latestOverallTime {
+					latestOverallTime = result.EndTime
+					latestOverallStatus = result.Status
+				}
+
+				// Track the latest passed result
 				if result.Status == "passed" {
 					hasPassed = true
 					if result.EndTime > latestPassedTime {
@@ -92,13 +101,15 @@ func processResults(runResults map[int][]TestResult) []int {
 			}
 
 			if hasPassed {
-				for _, result := range caseResults {
-					if result.Status != "passed" && result.EndTime >= latestPassedTime {
-						keepRunID = true
-						break
-					}
+				// Only keep the run if the latest result overall is a "passed" result
+				if latestPassedTime == latestOverallTime && latestOverallStatus == "passed" {
+					keepRunID = true
+				} else {
+					keepRunID = false
+					break // No need to check further, discard the run
 				}
 			} else {
+				// If there's no pass at all for this case, discard the run
 				keepRunID = false
 				break
 			}
