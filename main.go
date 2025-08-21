@@ -7,7 +7,6 @@ import (
 	"complete_run/match"
 	"flag"
 	"fmt"
-	"os"
 )
 
 func main() {
