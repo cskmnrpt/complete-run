@@ -2,9 +2,11 @@ package complete
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -30,6 +32,95 @@ type RunsAPIResponse struct {
 type Run struct {
 	ID     int `json:"id"`
 	Status int `json:"status"`
+}
+
+// RetryConfig holds configuration for retry mechanism
+type RetryConfig struct {
+	MaxRetries      int
+	InitialDelay    time.Duration
+	MaxDelay        time.Duration
+	BackoffFactor   float64
+	RequestTimeout  time.Duration
+}
+
+// Default retry configuration
+var defaultRetryConfig = RetryConfig{
+	MaxRetries:      3,
+	InitialDelay:    500 * time.Millisecond,
+	MaxDelay:        10 * time.Second,
+	BackoffFactor:   2.0,
+	RequestTimeout:  30 * time.Second,
+}
+
+// Create HTTP client with timeout
+var httpClient = &http.Client{
+	Timeout: defaultRetryConfig.RequestTimeout,
+}
+
+// isRetryableError determines if an error should be retried
+func isRetryableError(err error, statusCode int) bool {
+	if err != nil {
+		// Network errors, timeouts, etc. are retryable
+		return true
+	}
+	
+	// HTTP status codes that are retryable
+	switch statusCode {
+	case 429: // Too Many Requests
+		return true
+	case 500, 502, 503, 504: // Server errors
+		return true
+	default:
+		return false
+	}
+}
+
+// calculateBackoffDelay calculates the delay for exponential backoff
+func calculateBackoffDelay(attempt int, config RetryConfig) time.Duration {
+	delay := time.Duration(float64(config.InitialDelay) * math.Pow(config.BackoffFactor, float64(attempt)))
+	if delay > config.MaxDelay {
+		delay = config.MaxDelay
+	}
+	return delay
+}
+
+// retryableHTTPRequest performs an HTTP request with retry logic
+func retryableHTTPRequest(req *http.Request, config RetryConfig) (*http.Response, error) {
+	var lastErr error
+	var resp *http.Response
+	
+	for attempt := 0; attempt <= config.MaxRetries; attempt++ {
+		// Create a new context for each attempt
+		ctx, cancel := context.WithTimeout(context.Background(), config.RequestTimeout)
+		reqWithContext := req.WithContext(ctx)
+		
+		resp, lastErr = httpClient.Do(reqWithContext)
+		cancel()
+		
+		if lastErr == nil && resp != nil {
+			// Check if the status code indicates success or non-retryable error
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return resp, nil
+			}
+			
+			if !isRetryableError(nil, resp.StatusCode) {
+				return resp, fmt.Errorf("non-retryable HTTP error: %d", resp.StatusCode)
+			}
+			
+			// Close the response body for retryable errors
+			resp.Body.Close()
+		}
+		
+		// Don't sleep after the last attempt
+		if attempt < config.MaxRetries {
+			delay := calculateBackoffDelay(attempt, config)
+			fmt.Printf("Request failed (attempt %d/%d), retrying in %v...\n", 
+				attempt+1, config.MaxRetries+1, delay)
+			time.Sleep(delay)
+		}
+	}
+	
+	return resp, fmt.Errorf("request failed after %d attempts: %v", config.MaxRetries+1, lastErr)
 }
 
 func CompleteRuns() {
@@ -69,28 +160,49 @@ func readRunIDs(filename string) []int {
 
 func completeRun(apiToken, projectCode string, runID int) bool {
 	url := fmt.Sprintf("https://api.qase.io/v1/run/%s/%d/complete", projectCode, runID)
-	req, _ := http.NewRequest("POST", url, nil)
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		fmt.Printf("Error creating request for run %d: %v\n", runID, err)
+		return false
+	}
 	req.Header.Add("accept", "application/json")
 	req.Header.Add("Token", apiToken)
 
-	res, err := http.DefaultClient.Do(req)
+	// Use a more aggressive retry config for completion calls
+	completionRetryConfig := RetryConfig{
+		MaxRetries:      2, // Fewer retries for completion to avoid duplicate operations
+		InitialDelay:    300 * time.Millisecond,
+		MaxDelay:        5 * time.Second,
+		BackoffFactor:   2.0,
+		RequestTimeout:  20 * time.Second,
+	}
+
+	res, err := retryableHTTPRequest(req, completionRetryConfig)
 	if err != nil {
-		fmt.Println("API request failed:", err)
+		fmt.Printf("API request failed for run %d after retries: %v ❌\n", runID, err)
 		return false
 	}
 	defer res.Body.Close()
 
-	body, _ := io.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		fmt.Printf("Error reading response for run %d: %v ❌\n", runID, err)
+		return false
+	}
+
 	var apiResp APIResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
-		fmt.Println("Error parsing JSON response:", err)
+		fmt.Printf("Error parsing JSON response for run %d: %v ❌\n", runID, err)
 		return false
 	}
 
 	if apiResp.Status {
-		fmt.Printf("Successfully marked Run ID %d as complete ✅\n", runID) // <-- Success message
+		fmt.Printf("Successfully marked Run ID %d as complete ✅\n", runID)
 	} else {
-		fmt.Printf("Failed to mark Run ID %d as complete ❌\n", runID)
+		fmt.Printf("Failed to mark Run ID %d as complete (API returned false) ❌\n", runID)
+		if apiResp.ErrorMessage != "" {
+			fmt.Printf("  Error message: %s\n", apiResp.ErrorMessage)
+		}
 	}
 
 	return apiResp.Status
@@ -137,62 +249,89 @@ func fetchAllInProgressRuns(apiToken, projectCode string) []int {
 	const limit = 100
 	var allInProgressRuns []int
 	offset := 0
+	consecutiveFailures := 0
+	maxConsecutiveFailures := 3
+
+	fmt.Println("Starting to fetch test runs with robust retry mechanism...")
 
 	for {
 		url := fmt.Sprintf("https://api.qase.io/v1/run/%s?limit=%d&offset=%d", projectCode, limit, offset)
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			fmt.Printf("Error creating request: %v\n", err)
-			break
+			consecutiveFailures++
+			if consecutiveFailures >= maxConsecutiveFailures {
+				fmt.Printf("Too many consecutive failures (%d), stopping fetch process\n", consecutiveFailures)
+				break
+			}
+			continue
 		}
 		req.Header.Add("accept", "application/json")
 		req.Header.Add("Token", apiToken)
 
-		resp, err := http.DefaultClient.Do(req)
+		fmt.Printf("Fetching runs at offset %d...\n", offset)
+		resp, err := retryableHTTPRequest(req, defaultRetryConfig)
 		if err != nil {
-			fmt.Printf("Request error: %v\n", err)
-			break
+			fmt.Printf("Failed to fetch runs at offset %d after retries: %v\n", offset, err)
+			consecutiveFailures++
+			if consecutiveFailures >= maxConsecutiveFailures {
+				fmt.Printf("Too many consecutive failures (%d), stopping fetch process\n", consecutiveFailures)
+				break
+			}
+			// Skip this batch and try the next one
+			offset += limit
+			continue
 		}
 		defer resp.Body.Close()
+
+		// Reset consecutive failures on successful request
+		consecutiveFailures = 0
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			fmt.Printf("Error reading response: %v\n", err)
-			break
+			offset += limit
+			continue
 		}
 
 		var apiResp RunsAPIResponse
 		if err := json.Unmarshal(body, &apiResp); err != nil {
 			fmt.Printf("Error parsing JSON: %v\n", err)
-			break
+			offset += limit
+			continue
 		}
 
 		if !apiResp.Status {
-			fmt.Println("API response status is false")
-			break
+			fmt.Printf("API response status is false at offset %d, skipping batch\n", offset)
+			offset += limit
+			continue
 		}
 
 		// Filter for in-progress runs (status = 0)
+		batchInProgressCount := 0
 		for _, run := range apiResp.Result.Entities {
 			if run.Status == 0 { // 0 = in-progress
 				allInProgressRuns = append(allInProgressRuns, run.ID)
+				batchInProgressCount++
 			}
 		}
 
-		fmt.Printf("Fetched %d runs (offset: %d), found %d in-progress so far\n", 
-			len(apiResp.Result.Entities), offset, len(allInProgressRuns))
+		fmt.Printf("✅ Fetched %d runs (offset: %d), found %d in-progress in this batch, %d total so far\n", 
+			len(apiResp.Result.Entities), offset, batchInProgressCount, len(allInProgressRuns))
 
 		// Check if we've fetched all runs
 		if len(apiResp.Result.Entities) < limit {
+			fmt.Println("Reached end of test runs")
 			break
 		}
 
 		offset += limit
 		
 		// Small delay to be respectful to the API
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 
+	fmt.Printf("Fetch complete. Found %d in-progress runs total\n", len(allInProgressRuns))
 	return allInProgressRuns
 }
 
