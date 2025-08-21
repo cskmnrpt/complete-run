@@ -2,7 +2,6 @@ package complete
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -90,12 +89,8 @@ func retryableHTTPRequest(req *http.Request, config RetryConfig) (*http.Response
 	var resp *http.Response
 	
 	for attempt := 0; attempt <= config.MaxRetries; attempt++ {
-		// Create a new context for each attempt
-		ctx, cancel := context.WithTimeout(context.Background(), config.RequestTimeout)
-		reqWithContext := req.WithContext(ctx)
-		
-		resp, lastErr = httpClient.Do(reqWithContext)
-		cancel()
+		// Use the HTTP client's timeout instead of context timeout to avoid conflicts
+		resp, lastErr = httpClient.Do(req)
 		
 		if lastErr == nil && resp != nil {
 			// Check if the status code indicates success or non-retryable error
